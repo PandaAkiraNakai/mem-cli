@@ -1,0 +1,323 @@
+#!/usr/bin/env bash
+# mem — CLI sobre SQLite para memorias y pedidos persistentes.
+#
+# Default DB (XDG):  ${XDG_DATA_HOME:-~/.local/share}/mem/memory.db
+# Override:          export MEM_DB=/ruta/a/tu/memory.db
+#
+# Si la DB no existe, se crea automáticamente con el schema completo
+# (tablas memorias + pedidos, sus índices y triggers).
+set -euo pipefail
+
+DB="${MEM_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/mem/memory.db}"
+SQLITE=$(command -v sqlite3)
+
+if [[ -z "$SQLITE" ]]; then
+  echo "sqlite3 no encontrado en PATH" >&2
+  exit 1
+fi
+
+# Bootstrap: si la DB no existe, crearla con el schema.
+if [[ ! -f "$DB" ]]; then
+  mkdir -p "$(dirname "$DB")"
+  "$SQLITE" "$DB" <<'SQL'
+CREATE TABLE memorias (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  tipo        TEXT NOT NULL CHECK(tipo IN ('user','feedback','project','reference','nota')),
+  nombre      TEXT NOT NULL UNIQUE,
+  resumen     TEXT NOT NULL,
+  contenido   TEXT NOT NULL,
+  tags        TEXT,
+  activo      INTEGER NOT NULL DEFAULT 1,
+  creado      TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+  actualizado TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX idx_mem_tipo ON memorias(tipo);
+CREATE INDEX idx_mem_activo ON memorias(activo);
+CREATE TRIGGER trg_mem_actualizado
+AFTER UPDATE ON memorias FOR EACH ROW
+BEGIN
+  UPDATE memorias SET actualizado = datetime('now','localtime') WHERE id = OLD.id;
+END;
+
+CREATE TABLE pedidos (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  titulo      TEXT NOT NULL,
+  detalle     TEXT,
+  estado      TEXT NOT NULL DEFAULT 'pendiente'
+              CHECK(estado IN ('pendiente','en_progreso','hecho','cancelado')),
+  prioridad   TEXT NOT NULL DEFAULT 'normal'
+              CHECK(prioridad IN ('baja','normal','alta','urgente')),
+  vence       TEXT,
+  notas       TEXT,
+  creado      TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+  actualizado TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+  completado  TEXT
+);
+CREATE INDEX idx_ped_estado ON pedidos(estado);
+CREATE INDEX idx_ped_prioridad ON pedidos(prioridad);
+CREATE TRIGGER trg_ped_actualizado
+AFTER UPDATE OF titulo, detalle, estado, prioridad, vence, notas ON pedidos FOR EACH ROW
+BEGIN
+  UPDATE pedidos SET actualizado = datetime('now','localtime') WHERE id = OLD.id;
+END;
+CREATE TRIGGER trg_ped_completado
+AFTER UPDATE OF estado ON pedidos FOR EACH ROW
+WHEN NEW.estado = 'hecho' AND OLD.estado <> 'hecho'
+BEGIN
+  UPDATE pedidos SET completado = datetime('now','localtime') WHERE id = OLD.id;
+END;
+SQL
+fi
+
+q() { "$SQLITE" "$DB" "$@"; }
+
+usage() {
+  cat <<'EOF'
+mem — memorias y pedidos persistentes en SQLite
+
+DB: $MEM_DB (default: ${XDG_DATA_HOME:-~/.local/share}/mem/memory.db)
+
+PEDIDOS
+  mem add <titulo> [--detalle TXT] [--prio baja|normal|alta|urgente] [--vence YYYY-MM-DD]
+  mem ls [--estado pendiente|en_progreso|hecho|cancelado|todos] [--prio P]
+  mem show <id>
+  mem do <id>                  marcar hecho
+  mem wip <id>                 marcar en_progreso
+  mem cancel <id>
+  mem note <id> <texto>        agregar nota (append)
+  mem rm <id>                  borrar definitivamente
+
+MEMORIAS
+  mem remember <tipo> <nombre> <resumen> [--contenido TXT] [--tags csv]
+                                tipos: user|feedback|project|reference|nota
+  mem mem-ls [--tipo T] [--all]
+  mem mem-show <nombre|id>
+  mem mem-rm <nombre|id>
+  mem mem-off <nombre|id>      desactivar (activo=0)
+  mem mem-on <nombre|id>
+
+CONTEXTO (pensado para inyectar al iniciar una sesión de Claude Code u otro asistente)
+  mem context                  imprime resumen markdown
+  mem raw <SQL>                ejecutar SQL crudo
+
+EOF
+}
+
+# ---------- helpers ----------
+ts_arg() { printf "%s" "$1" | sed "s/'/''/g"; }
+
+# Resolver id|nombre para memorias -> id
+mem_resolve() {
+  local key="$1"
+  if [[ "$key" =~ ^[0-9]+$ ]]; then
+    echo "$key"
+  else
+    q -noheader "SELECT id FROM memorias WHERE nombre='$(ts_arg "$key")' LIMIT 1;"
+  fi
+}
+
+# ---------- pedidos ----------
+cmd_add() {
+  local titulo="${1:?titulo requerido}"; shift || true
+  local detalle="" prio="normal" vence=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --detalle) detalle="$2"; shift 2;;
+      --prio)    prio="$2"; shift 2;;
+      --vence)   vence="$2"; shift 2;;
+      *) echo "flag desconocido: $1" >&2; exit 2;;
+    esac
+  done
+  local id
+  id=$(q -noheader "INSERT INTO pedidos(titulo,detalle,prioridad,vence)
+     VALUES('$(ts_arg "$titulo")',
+            NULLIF('$(ts_arg "$detalle")',''),
+            '$(ts_arg "$prio")',
+            NULLIF('$(ts_arg "$vence")',''))
+     RETURNING id;")
+  echo "pedido #$id creado"
+}
+
+cmd_ls() {
+  local estado="pendiente,en_progreso" prio=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --estado) estado="$2"; shift 2;;
+      --prio)   prio="$2"; shift 2;;
+      *) echo "flag desconocido: $1" >&2; exit 2;;
+    esac
+  done
+  local where=""
+  if [[ "$estado" != "todos" ]]; then
+    local in_list; in_list=$(printf "'%s'," $(echo "$estado" | tr ',' ' ') | sed 's/,$//')
+    where="WHERE estado IN ($in_list)"
+  fi
+  if [[ -n "$prio" ]]; then
+    [[ -n "$where" ]] && where+=" AND " || where="WHERE "
+    where+="prioridad='$(ts_arg "$prio")'"
+  fi
+  q -box "SELECT id, estado, prioridad AS prio, titulo,
+                 COALESCE(vence,'') AS vence,
+                 substr(creado,1,16) AS creado
+          FROM pedidos $where
+          ORDER BY
+            CASE prioridad WHEN 'urgente' THEN 0 WHEN 'alta' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END,
+            id DESC;"
+}
+
+cmd_show() {
+  local id="${1:?id requerido}"
+  q -box "SELECT * FROM pedidos WHERE id=$id;"
+}
+
+cmd_setestado() {
+  local id="${1:?id requerido}" estado="$2"
+  q "UPDATE pedidos SET estado='$estado' WHERE id=$id;"
+  echo "pedido #$id -> $estado"
+}
+
+cmd_note() {
+  local id="${1:?id requerido}"; shift
+  local nota="$*"
+  q "UPDATE pedidos
+     SET notas = COALESCE(notas || char(10), '') ||
+                 '[' || datetime('now','localtime') || '] ' || '$(ts_arg "$nota")'
+     WHERE id=$id;"
+  echo "nota agregada a #$id"
+}
+
+cmd_rm() {
+  local id="${1:?id requerido}"
+  q "DELETE FROM pedidos WHERE id=$id;"
+  echo "pedido #$id eliminado"
+}
+
+# ---------- memorias ----------
+cmd_remember() {
+  local tipo="${1:?tipo requerido}" nombre="${2:?nombre requerido}" resumen="${3:?resumen requerido}"
+  shift 3 || true
+  local contenido="$resumen" tags=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --contenido) contenido="$2"; shift 2;;
+      --tags)      tags="$2"; shift 2;;
+      *) echo "flag desconocido: $1" >&2; exit 2;;
+    esac
+  done
+  q "INSERT INTO memorias(tipo,nombre,resumen,contenido,tags)
+     VALUES('$(ts_arg "$tipo")','$(ts_arg "$nombre")',
+            '$(ts_arg "$resumen")','$(ts_arg "$contenido")',
+            NULLIF('$(ts_arg "$tags")',''))
+     ON CONFLICT(nombre) DO UPDATE SET
+       tipo=excluded.tipo,
+       resumen=excluded.resumen,
+       contenido=excluded.contenido,
+       tags=excluded.tags,
+       activo=1;"
+  echo "memoria '$nombre' guardada"
+}
+
+cmd_mem_ls() {
+  local tipo="" all=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --tipo) tipo="$2"; shift 2;;
+      --all)  all=1; shift;;
+      *) echo "flag desconocido: $1" >&2; exit 2;;
+    esac
+  done
+  local where=""
+  [[ $all -eq 0 ]] && where="WHERE activo=1"
+  if [[ -n "$tipo" ]]; then
+    [[ -n "$where" ]] && where+=" AND " || where="WHERE "
+    where+="tipo='$(ts_arg "$tipo")'"
+  fi
+  q -box "SELECT id, tipo, nombre, resumen, activo,
+                 substr(actualizado,1,16) AS actualizado
+          FROM memorias $where ORDER BY tipo, nombre;"
+}
+
+cmd_mem_show() {
+  local key="${1:?nombre o id requerido}"
+  local id; id=$(mem_resolve "$key")
+  [[ -z "$id" ]] && { echo "no encontrado: $key" >&2; exit 1; }
+  q -box "SELECT * FROM memorias WHERE id=$id;"
+}
+
+cmd_mem_rm() {
+  local key="${1:?nombre o id requerido}"
+  local id; id=$(mem_resolve "$key")
+  [[ -z "$id" ]] && { echo "no encontrado: $key" >&2; exit 1; }
+  q "DELETE FROM memorias WHERE id=$id;"
+  echo "memoria #$id eliminada"
+}
+
+cmd_mem_toggle() {
+  local key="$1" valor="$2"
+  local id; id=$(mem_resolve "$key")
+  [[ -z "$id" ]] && { echo "no encontrado: $key" >&2; exit 1; }
+  q "UPDATE memorias SET activo=$valor WHERE id=$id;"
+  echo "memoria #$id activo=$valor"
+}
+
+# ---------- contexto (markdown para inyectar a asistentes / sesiones) ----------
+cmd_context() {
+  local out=""
+  local pend
+  pend=$(q -noheader -separator '|' \
+    "SELECT id, prioridad, titulo, COALESCE(vence,'') FROM pedidos
+     WHERE estado IN ('pendiente','en_progreso')
+     ORDER BY CASE prioridad WHEN 'urgente' THEN 0 WHEN 'alta' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END, id;")
+  if [[ -n "$pend" ]]; then
+    out+="## Pedidos pendientes (SQLite $DB)"$'\n'
+    while IFS='|' read -r id prio titulo vence; do
+      local sufijo=""
+      [[ -n "$vence" ]] && sufijo=" (vence $vence)"
+      out+="- #$id [$prio] $titulo$sufijo"$'\n'
+    done <<< "$pend"
+    out+=$'\n'
+  fi
+
+  local mem
+  mem=$(q -noheader -separator '|' \
+    "SELECT tipo, nombre, resumen FROM memorias WHERE activo=1 ORDER BY tipo, nombre;")
+  if [[ -n "$mem" ]]; then
+    out+="## Memorias SQLite activas"$'\n'
+    while IFS='|' read -r tipo nombre resumen; do
+      out+="- [$tipo] $nombre — $resumen"$'\n'
+    done <<< "$mem"
+    out+=$'\n'
+    out+="(Usa 'mem mem-show <nombre>' para el contenido completo, 'mem ls' para los pedidos.)"$'\n'
+  fi
+
+  if [[ -z "$out" ]]; then
+    echo ""
+  else
+    echo "$out"
+  fi
+}
+
+cmd_raw() { q "$@"; }
+
+# ---------- dispatch ----------
+sub="${1:-help}"; shift || true
+case "$sub" in
+  help|-h|--help) usage ;;
+  add)        cmd_add "$@" ;;
+  ls)         cmd_ls "$@" ;;
+  show)       cmd_show "$@" ;;
+  do)         cmd_setestado "$1" hecho ;;
+  wip)        cmd_setestado "$1" en_progreso ;;
+  cancel)     cmd_setestado "$1" cancelado ;;
+  note)       cmd_note "$@" ;;
+  rm)         cmd_rm "$@" ;;
+  remember)   cmd_remember "$@" ;;
+  mem-ls)     cmd_mem_ls "$@" ;;
+  mem-show)   cmd_mem_show "$@" ;;
+  mem-rm)     cmd_mem_rm "$@" ;;
+  mem-off)    cmd_mem_toggle "$1" 0 ;;
+  mem-on)     cmd_mem_toggle "$1" 1 ;;
+  context)    cmd_context ;;
+  raw)        cmd_raw "$@" ;;
+  *) echo "subcomando desconocido: $sub" >&2; usage; exit 2 ;;
+esac
