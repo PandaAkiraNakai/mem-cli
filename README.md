@@ -160,3 +160,7 @@ Cada conversación arranca con los pedidos pendientes y memorias activas ya en c
 ## Licencia
 
 MIT — ver [LICENSE](LICENSE).
+
+<!-- profile-excerpt -->
+CLI minimal en bash sobre **SQLite** para **memorias** (hechos persistentes inyectables al inicio de sesión) y **pedidos** (TODOs con estado y prioridad). Pensado como capa de memoria local para **Claude Code** vía hook `SessionStart`, pero sirve para cualquier flujo que necesite estado persistente accesible por CLI. Bootstrap automático del schema, XDG-compliant, cero dependencias más allá de `bash` + `sqlite3`.
+<!-- /profile-excerpt -->
