@@ -27,6 +27,7 @@ CREATE TABLE memorias (
   resumen     TEXT NOT NULL,
   contenido   TEXT NOT NULL,
   tags        TEXT,
+  dispositivo TEXT NOT NULL DEFAULT 'compartida',
   activo      INTEGER NOT NULL DEFAULT 1,
   creado      TEXT NOT NULL DEFAULT (datetime('now','localtime')),
   actualizado TEXT NOT NULL DEFAULT (datetime('now','localtime'))
@@ -71,6 +72,24 @@ fi
 
 q() { "$SQLITE" "$DB" "$@"; }
 
+# ---------- dispositivo (scope de memorias) ----------
+# Etiqueta de este equipo: $MEM_DEVICE > archivo .device junto a la DB > hostname.
+DATA_DIR="$(dirname "$(readlink -f "$DB" 2>/dev/null || echo "$DB")")"
+DEVICE="${MEM_DEVICE:-}"
+if [[ -z "$DEVICE" && -f "$DATA_DIR/.device" ]]; then
+  DEVICE="$(head -n1 "$DATA_DIR/.device" | tr -d '[:space:]')"
+fi
+[[ -z "$DEVICE" ]] && DEVICE="$(hostname -s 2>/dev/null || hostname)"
+
+# Migración idempotente: agrega la columna dispositivo si falta (compatible con DBs viejas).
+ensure_schema() {
+  local has
+  has=$(q -noheader "SELECT COUNT(*) FROM pragma_table_info('memorias') WHERE name='dispositivo';")
+  if [[ "$has" != "1" ]]; then
+    q "ALTER TABLE memorias ADD COLUMN dispositivo TEXT NOT NULL DEFAULT 'compartida';" 2>/dev/null || true
+  fi
+}
+
 usage() {
   cat <<'EOF'
 mem — memorias y pedidos persistentes en SQLite
@@ -88,16 +107,23 @@ PEDIDOS
   mem rm <id>                  borrar definitivamente
 
 MEMORIAS
-  mem remember <tipo> <nombre> <resumen> [--contenido TXT] [--tags csv]
+  mem remember <tipo> <nombre> <resumen> [--contenido TXT] [--tags csv] [--dispositivo D]
                                 tipos: user|feedback|project|reference|nota
-  mem mem-ls [--tipo T] [--all]
+  mem mem-ls [--tipo T] [--dispositivo D] [--here] [--all]
   mem mem-show <nombre|id>
   mem mem-rm <nombre|id>
   mem mem-off <nombre|id>      desactivar (activo=0)
   mem mem-on <nombre|id>
 
+DISPOSITIVO (scope: qué memorias ve cada equipo)
+  mem device                   muestra la etiqueta de este equipo
+  mem device <nombre>          fija la etiqueta (escribe .device junto a la DB)
+  --dispositivo D al recordar  D = compartida (default) | torre | laptop | mac | ...
+  Solo se inyectan al contexto las memorias 'compartida' + las de ESTE equipo.
+  Precedencia de la etiqueta: $MEM_DEVICE > .device > hostname.
+
 CONTEXTO (pensado para inyectar al iniciar una sesión de Claude Code u otro asistente)
-  mem context                  imprime resumen markdown
+  mem context                  imprime resumen markdown (filtra por dispositivo)
   mem raw <SQL>                ejecutar SQL crudo
 
 EOF
@@ -196,45 +222,50 @@ cmd_rm() {
 cmd_remember() {
   local tipo="${1:?tipo requerido}" nombre="${2:?nombre requerido}" resumen="${3:?resumen requerido}"
   shift 3 || true
-  local contenido="$resumen" tags=""
+  local contenido="$resumen" tags="" disp=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --contenido) contenido="$2"; shift 2;;
-      --tags)      tags="$2"; shift 2;;
+      --contenido)            contenido="$2"; shift 2;;
+      --tags)                 tags="$2"; shift 2;;
+      --dispositivo|--device) disp="$2"; shift 2;;
       *) echo "flag desconocido: $1" >&2; exit 2;;
     esac
   done
-  q "INSERT INTO memorias(tipo,nombre,resumen,contenido,tags)
+  q "INSERT INTO memorias(tipo,nombre,resumen,contenido,tags,dispositivo)
      VALUES('$(ts_arg "$tipo")','$(ts_arg "$nombre")',
             '$(ts_arg "$resumen")','$(ts_arg "$contenido")',
-            NULLIF('$(ts_arg "$tags")',''))
+            NULLIF('$(ts_arg "$tags")',''),
+            COALESCE(NULLIF('$(ts_arg "$disp")',''),'compartida'))
      ON CONFLICT(nombre) DO UPDATE SET
        tipo=excluded.tipo,
        resumen=excluded.resumen,
        contenido=excluded.contenido,
        tags=excluded.tags,
+       dispositivo=CASE WHEN '$(ts_arg "$disp")'='' THEN memorias.dispositivo ELSE '$(ts_arg "$disp")' END,
        activo=1;"
   echo "memoria '$nombre' guardada"
 }
 
 cmd_mem_ls() {
-  local tipo="" all=0
+  local tipo="" all=0 disp="" here=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --tipo) tipo="$2"; shift 2;;
       --all)  all=1; shift;;
+      --dispositivo|--device) disp="$2"; shift 2;;
+      --here) here=1; shift;;
       *) echo "flag desconocido: $1" >&2; exit 2;;
     esac
   done
   local where=""
   [[ $all -eq 0 ]] && where="WHERE activo=1"
-  if [[ -n "$tipo" ]]; then
-    [[ -n "$where" ]] && where+=" AND " || where="WHERE "
-    where+="tipo='$(ts_arg "$tipo")'"
-  fi
-  q -box "SELECT id, tipo, nombre, resumen, activo,
+  add_where() { [[ -n "$where" ]] && where+=" AND " || where="WHERE "; where+="$1"; }
+  [[ -n "$tipo" ]] && add_where "tipo='$(ts_arg "$tipo")'"
+  [[ -n "$disp" ]] && add_where "dispositivo='$(ts_arg "$disp")'"
+  [[ $here -eq 1 ]] && add_where "(dispositivo='compartida' OR dispositivo='$(ts_arg "$DEVICE")')"
+  q -box "SELECT id, tipo, nombre, resumen, dispositivo AS disp, activo,
                  substr(actualizado,1,16) AS actualizado
-          FROM memorias $where ORDER BY tipo, nombre;"
+          FROM memorias $where ORDER BY dispositivo, tipo, nombre;"
 }
 
 cmd_mem_show() {
@@ -280,7 +311,9 @@ cmd_context() {
 
   local mem
   mem=$(q -noheader -separator '|' \
-    "SELECT tipo, nombre, resumen FROM memorias WHERE activo=1 ORDER BY tipo, nombre;")
+    "SELECT tipo, nombre, resumen FROM memorias
+     WHERE activo=1 AND (dispositivo='compartida' OR dispositivo='$(ts_arg "$DEVICE")')
+     ORDER BY tipo, nombre;")
   if [[ -n "$mem" ]]; then
     out+="## Memorias SQLite activas"$'\n'
     while IFS='|' read -r tipo nombre resumen; do
@@ -299,8 +332,18 @@ cmd_context() {
 
 cmd_raw() { q "$@"; }
 
+cmd_device() {
+  if [[ $# -gt 0 ]]; then
+    printf '%s\n' "$1" > "$DATA_DIR/.device"
+    echo "dispositivo de este equipo -> $1 ($DATA_DIR/.device)"
+  else
+    echo "$DEVICE"
+  fi
+}
+
 # ---------- dispatch ----------
 sub="${1:-help}"; shift || true
+case "$sub" in help|-h|--help|device) ;; *) ensure_schema ;; esac
 case "$sub" in
   help|-h|--help) usage ;;
   add)        cmd_add "$@" ;;
@@ -318,6 +361,7 @@ case "$sub" in
   mem-off)    cmd_mem_toggle "$1" 0 ;;
   mem-on)     cmd_mem_toggle "$1" 1 ;;
   context)    cmd_context ;;
+  device)     cmd_device "$@" ;;
   raw)        cmd_raw "$@" ;;
   *) echo "subcomando desconocido: $sub" >&2; usage; exit 2 ;;
 esac

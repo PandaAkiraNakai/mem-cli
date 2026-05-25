@@ -8,7 +8,7 @@ Pensado originalmente como capa de memoria local para [Claude Code](https://clau
 
 Dos tablas, cada una con su finalidad clara:
 
-- **memorias** — Hechos estables que querés que estén siempre disponibles. Tipados: `user`, `feedback`, `project`, `reference`, `nota`. Únicas por `nombre`. Activables / desactivables (`activo`).
+- **memorias** — Hechos estables que querés que estén siempre disponibles. Tipados: `user`, `feedback`, `project`, `reference`, `nota`. Únicas por `nombre`. Activables / desactivables (`activo`). Con **scope por dispositivo** (`dispositivo`): `compartida` (default, las ven todos los equipos) o una etiqueta de máquina (`torre`, `laptop`, `mac`, …) que solo se inyecta en ese equipo.
 - **pedidos** — TODOs con `estado` (pendiente / en_progreso / hecho / cancelado), `prioridad` (baja / normal / alta / urgente) y `vence` opcional. Historial de cambios via trigger.
 
 ## Instalación
@@ -70,6 +70,30 @@ mem mem-on  estilo-tests
 mem mem-rm  estilo-tests        # borrado definitivo
 ```
 
+### Memorias por dispositivo
+
+Cuando varias máquinas comparten la misma DB (p. ej. sincronizada vía git), la columna `dispositivo` separa lo común de la config propia de cada equipo. Cada máquina declara su etiqueta una vez:
+
+```bash
+mem device            # muestra la etiqueta actual
+mem device laptop     # la fija (escribe un archivo .device junto a la DB)
+```
+
+Precedencia de la etiqueta: `$MEM_DEVICE` > archivo `.device` > `hostname`. El `.device` es local: no lo sincronices (agregalo al `.gitignore`).
+
+```bash
+# memoria compartida (default) — la ven todos los equipos
+mem remember reference api-key-rotacion "Las API keys rotan cada 90 días"
+
+# memoria específica de este equipo — solo se inyecta acá
+mem remember reference monitores "Layout: 3 pantallas, central a 144Hz" --dispositivo laptop
+
+mem mem-ls --here              # solo compartidas + las de este equipo
+mem mem-ls --dispositivo mac   # solo las de un equipo
+```
+
+`mem context` filtra automáticamente: inyecta las `compartida` + las del equipo actual, nunca la config de otra máquina.
+
 ### Contexto (para inyectar en una sesión)
 
 ```bash
@@ -109,6 +133,7 @@ CREATE TABLE memorias (
   resumen     TEXT NOT NULL,
   contenido   TEXT NOT NULL,
   tags        TEXT,
+  dispositivo TEXT NOT NULL DEFAULT 'compartida',
   activo      INTEGER NOT NULL DEFAULT 1,
   creado      TEXT NOT NULL DEFAULT (datetime('now','localtime')),
   actualizado TEXT NOT NULL DEFAULT (datetime('now','localtime'))
@@ -136,7 +161,7 @@ Triggers automáticos: `actualizado` se refresca en cada UPDATE, y `completado` 
 
 - **Cero dependencias** más allá de `bash`, `sqlite3` y `coreutils`. Funciona en cualquier Linux y macOS sin instalar nada raro.
 - **DB portable**: copiar el `.db` a otra máquina, listo. Backup con `cp`. Encriptado opcional con `sqlcipher` si querés.
-- **Migraciones**: hoy ninguna. Si el schema crece, se agregan `ALTER TABLE` idempotentes al bootstrap.
+- **Migraciones**: idempotentes y automáticas. Al correr cualquier comando, `mem` agrega columnas faltantes (p. ej. `dispositivo`) sobre DBs viejas sin romper nada, así que actualizar el script es suficiente.
 
 ## Integración con Claude Code
 
