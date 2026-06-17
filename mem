@@ -72,6 +72,11 @@ fi
 
 q() { "$SQLITE" "$DB" "$@"; }
 
+# ---------- capa semantica (helper Python + Ollama) ----------
+MEM_VEC_PY="$(dirname "$(readlink -f "$0")")/../share/mem/mem_vec.py"
+[[ -f "$MEM_VEC_PY" ]] || MEM_VEC_PY="$DATA_DIR/mem_vec.py"
+vec() { MEM_DB="$DB" python3 "$MEM_VEC_PY" "$@"; }
+
 # ---------- dispositivo (scope de memorias) ----------
 # Etiqueta de este equipo: $MEM_DEVICE > archivo .device junto a la DB > hostname.
 DATA_DIR="$(dirname "$(readlink -f "$DB" 2>/dev/null || echo "$DB")")"
@@ -114,6 +119,15 @@ MEMORIAS
   mem mem-rm <nombre|id>
   mem mem-off <nombre|id>      desactivar (activo=0)
   mem mem-on <nombre|id>
+
+BUSQUEDA SEMANTICA (embeddings locales via Ollama, modelo nomic-embed-text)
+  mem search <consulta> [-k N] [--here] [--device D]
+                                busca por significado, no por palabra exacta
+  mem reindex [--all]          regenera embeddings (auto tras cada 'remember')
+  mem warmup                   precarga el modelo en VRAM (detached, no bloquea)
+
+CONTEXTO LITE (modo oficial: solo reglas+identidad, resto on-demand)
+  mem context --lite           lo que inyecta el hook SessionStart
 
 DISPOSITIVO (scope: qué memorias ve cada equipo)
   mem device                   muestra la etiqueta de este equipo
@@ -244,7 +258,33 @@ cmd_remember() {
        dispositivo=CASE WHEN '$(ts_arg "$disp")'='' THEN memorias.dispositivo ELSE '$(ts_arg "$disp")' END,
        activo=1;"
   echo "memoria '$nombre' guardada"
+  # reindexa en segundo plano (no bloquea si Ollama esta caido)
+  ( vec reindex >/dev/null 2>&1 & )
 }
+
+# ---------- semantica ----------
+cmd_search() {
+  local consulta="" k=5 here=0 device=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -k)                     k="$2"; shift 2;;
+      --here)                 here=1; shift;;
+      --dispositivo|--device) device="$2"; shift 2;;
+      *) consulta="$1"; shift;;
+    esac
+  done
+  [[ -z "$consulta" ]] && { echo "uso: mem search <consulta> [-k N] [--here] [--device D]" >&2; exit 2; }
+  local extra=()
+  [[ $here -eq 1 ]] && extra+=(--here --here-device "$DEVICE")
+  [[ -n "$device" ]] && extra+=(--device "$device")
+  vec search "$consulta" -k "$k" "${extra[@]}"
+}
+
+cmd_reindex() { vec reindex "$@"; }
+
+# Precarga el modelo en VRAM, totalmente desacoplado (sobrevive al hook de
+# 5s). No bloquea: el hook lo invoca y sigue.
+cmd_warmup() { setsid -f bash -c "MEM_DB='$DB' python3 '$MEM_VEC_PY' warmup" >/dev/null 2>&1 </dev/null || true; }
 
 cmd_mem_ls() {
   local tipo="" all=0 disp="" here=0
@@ -293,6 +333,8 @@ cmd_mem_toggle() {
 
 # ---------- contexto (markdown para inyectar a asistentes / sesiones) ----------
 cmd_context() {
+  local lite=0
+  [[ "${1:-}" == "--lite" ]] && lite=1
   local out=""
   local pend
   pend=$(q -noheader -separator '|' \
@@ -309,18 +351,45 @@ cmd_context() {
     out+=$'\n'
   fi
 
-  local mem
-  mem=$(q -noheader -separator '|' \
-    "SELECT tipo, nombre, resumen FROM memorias
-     WHERE activo=1 AND (dispositivo='compartida' OR dispositivo='$(ts_arg "$DEVICE")')
-     ORDER BY tipo, nombre;")
-  if [[ -n "$mem" ]]; then
-    out+="## Memorias SQLite activas"$'\n'
-    while IFS='|' read -r tipo nombre resumen; do
-      out+="- [$tipo] $nombre — $resumen"$'\n'
-    done <<< "$mem"
-    out+=$'\n'
-    out+="(Usa 'mem mem-show <nombre>' para el contenido completo, 'mem ls' para los pedidos.)"$'\n'
+  # Filtro de scope por dispositivo (compartida + este equipo).
+  local scope="activo=1 AND (dispositivo='compartida' OR dispositivo='$(ts_arg "$DEVICE")')"
+
+  if [[ $lite -eq 1 ]]; then
+    # MODO SEMÁNTICO (oficial): solo se cargan SIEMPRE las reglas e identidad
+    # (feedback + user). El grueso (project/reference) se consulta on-demand
+    # por significado con 'mem search'. Nunca gatear reglas tras similitud.
+    local reglas
+    reglas=$(q -noheader -separator '|' \
+      "SELECT tipo, nombre, resumen FROM memorias
+       WHERE $scope AND tipo IN ('feedback','user') ORDER BY tipo, nombre;")
+    if [[ -n "$reglas" ]]; then
+      out+="## Reglas e identidad (SIEMPRE activas)"$'\n'
+      while IFS='|' read -r tipo nombre resumen; do
+        out+="- [$tipo] $nombre — $resumen"$'\n'
+      done <<< "$reglas"
+      out+=$'\n'
+    fi
+    local nproj
+    nproj=$(q -noheader "SELECT COUNT(*) FROM memorias WHERE $scope AND tipo IN ('project','reference','nota');")
+    out+="## Memoria semántica (on-demand vía Ollama)"$'\n'
+    out+="Hay $nproj memorias project/reference NO cargadas aquí. Recupéralas por"$'\n'
+    out+="significado con: \`mem search \"<consulta>\" [-k N]\` (embeddings qwen3 en GPU)."$'\n'
+    out+="ANTES de actuar en una tarea concreta, corre 'mem search' sobre el tema"$'\n'
+    out+="para traer infra/credenciales/contexto relevante. El modelo se está"$'\n'
+    out+="precalentando en background (~47s en frío la 1ª vez; luego ~0.6s)."$'\n'
+    out+="Detalle completo de una memoria: 'mem mem-show <nombre>'. Pedidos: 'mem ls'."$'\n'
+  else
+    local mem
+    mem=$(q -noheader -separator '|' \
+      "SELECT tipo, nombre, resumen FROM memorias WHERE $scope ORDER BY tipo, nombre;")
+    if [[ -n "$mem" ]]; then
+      out+="## Memorias SQLite activas"$'\n'
+      while IFS='|' read -r tipo nombre resumen; do
+        out+="- [$tipo] $nombre — $resumen"$'\n'
+      done <<< "$mem"
+      out+=$'\n'
+      out+="(Usa 'mem mem-show <nombre>' para el contenido completo, 'mem ls' para los pedidos.)"$'\n'
+    fi
   fi
 
   if [[ -z "$out" ]]; then
@@ -360,7 +429,10 @@ case "$sub" in
   mem-rm)     cmd_mem_rm "$@" ;;
   mem-off)    cmd_mem_toggle "$1" 0 ;;
   mem-on)     cmd_mem_toggle "$1" 1 ;;
-  context)    cmd_context ;;
+  search)     cmd_search "$@" ;;
+  reindex)    cmd_reindex "$@" ;;
+  warmup)     cmd_warmup "$@" ;;
+  context)    cmd_context "$@" ;;
   device)     cmd_device "$@" ;;
   raw)        cmd_raw "$@" ;;
   *) echo "subcomando desconocido: $sub" >&2; usage; exit 2 ;;

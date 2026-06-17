@@ -116,6 +116,24 @@ Ejemplo de output:
 (Usa 'mem mem-show <nombre>' para el contenido completo, 'mem ls' para los pedidos.)
 ```
 
+### Búsqueda semántica (opcional)
+
+En vez de volcar **todas** las memorias al contexto, puedes recuperarlas **por significado** bajo demanda. Requiere [Ollama](https://ollama.com) corriendo local (embeddings sin salir del equipo) y el helper `mem_vec.py` junto a la DB (`~/.local/share/mem/mem_vec.py`).
+
+```bash
+mem search "<consulta>" [-k N] [--here] [--device D]   # buscar por significado
+mem reindex [--all]        # generar/actualizar embeddings (auto en background tras cada 'remember')
+mem warmup                 # precargar el modelo en VRAM, sin bloquear (para el hook de sesión)
+mem context --lite         # contexto reducido: solo reglas (feedback+user) + pedidos + nota de búsqueda
+```
+
+Flujo recomendado para sesiones: el hook corre `mem warmup; mem context --lite`, inyecta solo reglas e identidad, y el asistente recupera el resto con `mem search` cuando una tarea lo necesita. Modelo por defecto `qwen3-embedding:4b`; cambiar con `MEM_EMBED_MODEL=<otro> mem reindex`.
+
+- Los vectores viven en `vec.db` (junto a la DB, **gitignored**): datos derivados, locales por equipo, regenerables con `mem reindex`.
+- Sin Ollama, `mem search` avisa y falla limpio; el resto del CLI funciona igual.
+
+> El helper `mem_vec.py` se distribuye en el repo de datos [`mem-db`](https://github.com/PandaAkiraNakai/mem-db), porque se despliega junto a `memory.db`.
+
 ### SQL crudo
 
 ```bash
