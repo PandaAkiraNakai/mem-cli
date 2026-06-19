@@ -72,9 +72,30 @@ fi
 
 q() { "$SQLITE" "$DB" "$@"; }
 
+# ---------- directorio de datos (junto a la DB) ----------
+# Se define ANTES de la capa semantica: el fallback de MEM_VEC_PY lo usa.
+DATA_DIR="$(dirname "$(readlink -f "$DB" 2>/dev/null || echo "$DB")")"
+
+# ---------- capa semantica (helper Python + Ollama) ----------
+MEM_VEC_PY="$(dirname "$(readlink -f "$0")")/../share/mem/mem_vec.py"
+[[ -f "$MEM_VEC_PY" ]] || MEM_VEC_PY="$DATA_DIR/mem_vec.py"
+vec() { MEM_DB="$DB" python3 "$MEM_VEC_PY" "$@"; }
+# Igual que vec() pero con timeout (1er arg = segundos): para tareas que tocan
+# el modelo generativo (contradicciones), que pueden tardar o colgarse.
+vec_to() {
+  local secs="$1"; shift
+  # 0 o no-numerico -> default finito. 'timeout 0' significa SIN limite: jamas
+  # debemos dejar que un valor invalido desactive el corte y cuelgue un guardado.
+  [[ "$secs" =~ ^[1-9][0-9]*$ ]] || secs=60
+  if command -v timeout >/dev/null 2>&1; then
+    MEM_DB="$DB" timeout "$secs" python3 "$MEM_VEC_PY" "$@"
+  else
+    MEM_DB="$DB" python3 "$MEM_VEC_PY" "$@"
+  fi
+}
+
 # ---------- dispositivo (scope de memorias) ----------
 # Etiqueta de este equipo: $MEM_DEVICE > archivo .device junto a la DB > hostname.
-DATA_DIR="$(dirname "$(readlink -f "$DB" 2>/dev/null || echo "$DB")")"
 DEVICE="${MEM_DEVICE:-}"
 if [[ -z "$DEVICE" && -f "$DATA_DIR/.device" ]]; then
   DEVICE="$(head -n1 "$DATA_DIR/.device" | tr -d '[:space:]')"
@@ -109,11 +130,59 @@ PEDIDOS
 MEMORIAS
   mem remember <tipo> <nombre> <resumen> [--contenido TXT] [--tags csv] [--dispositivo D]
                                 tipos: user|feedback|project|reference|nota
+                                dedupe semantico (via Ollama) antes de crear:
+                                avisa si ya hay algo parecido (>=0.80) y frena
+                                si es casi-identico (>=0.90, pregunta o aborta).
+                                --force / --no-dedupe   crear sin chequear
+                                --threshold N           umbral unico (avisar=frenar)
+                                env: MEM_DEDUPE_WARN / MEM_DEDUPE_BLOCK
+                                ademas avisa de posibles CONTRADICCIONES con
+                                memorias existentes (modelo instruct, advisory).
+                                --no-conflict / MEM_CONFLICT_CHECK=0  desactiva
+                                --auto-tag  redacta tags con el modelo si no diste --tags
   mem mem-ls [--tipo T] [--dispositivo D] [--here] [--all]
   mem mem-show <nombre|id>
   mem mem-rm <nombre|id>
   mem mem-off <nombre|id>      desactivar (activo=0)
   mem mem-on <nombre|id>
+
+BUSQUEDA SEMANTICA (embeddings locales via Ollama, modelo qwen3-embedding:4b)
+  mem search <consulta> [-k N] [--here] [--device D]
+                                busca MEMORIAS por significado, no por palabra exacta
+  mem psearch <consulta> [-k N] [--estado E] [--json]
+                                busca PEDIDOS (tareas) por significado
+  mem clusters [--threshold T] [--label] [--here] [--json]
+                                agrupa memorias por tema; muestra grupos y
+                                'aisladas' (huecos). --label: tema via modelo
+
+REDACCION ASISTIDA (via modelo instruct llama3.1:8b)
+  mem retag <nombre|id> [--apply]     tags consistentes (reusa tu vocabulario)
+  mem retag --untagged [--apply]      rellena tags de las memorias sin etiquetas
+  mem summarize <nombre|id> [--apply] recompacta el resumen desde el contenido
+  mem draft --contenido "..." [--tipo T] [--nombre N]   redacta resumen+tags
+  mem reindex [--all]          regenera embeddings de memorias Y pedidos
+  mem preindex                 regenera embeddings solo de pedidos (auto tras add/note/rm)
+  mem warmup                   precarga el modelo en VRAM (detached, no bloquea)
+
+AUDITORIA (staleness sin modelo; contradicciones via modelo instruct llama3.1:8b)
+  mem stale [--days N] [--versions] [--json]
+                                memorias viejas / con fechas o versiones dudosas
+  mem conflicts <nombre|id>    contradicciones de esa memoria vs las relacionadas
+  mem audit [--days N] [--versions]
+                                panel: staleness + contradicciones del corpus
+                                env: MEM_GEN_MODEL, MEM_STALE_DAYS, MEM_CONFLICT_REL
+
+RAG SOBRE TUS ARCHIVOS (apuntes, configs, dotfiles — busqueda por significado)
+  mem index <ruta>...          indexa archivos/carpetas (incremental por mtime+hash)
+                                omite secretos por defecto (claves, .env, history…);
+                                --include-secrets para forzar. --chunk-size N.
+  mem index                    refresca las raices ya indexadas
+  mem fsearch <consulta> [-k N] [--json]   busca en esos archivos (ruta:linea)
+  mem files [--json]           lista raices y archivos indexados
+  mem fprune                   quita del indice los archivos que ya no existen
+
+CONTEXTO LITE (modo oficial: solo reglas+identidad, resto on-demand)
+  mem context --lite           lo que inyecta el hook SessionStart
 
 DISPOSITIVO (scope: qué memorias ve cada equipo)
   mem device                   muestra la etiqueta de este equipo
@@ -162,6 +231,7 @@ cmd_add() {
             NULLIF('$(ts_arg "$vence")',''))
      RETURNING id;")
   echo "pedido #$id creado"
+  ( vec preindex >/dev/null 2>&1 & )   # embebe el pedido para 'mem psearch'
 }
 
 cmd_ls() {
@@ -210,27 +280,152 @@ cmd_note() {
                  '[' || datetime('now','localtime') || '] ' || '$(ts_arg "$nota")'
      WHERE id=$id;"
   echo "nota agregada a #$id"
+  ( vec preindex >/dev/null 2>&1 & )   # re-embebe (la nota cambia el texto)
 }
 
 cmd_rm() {
   local id="${1:?id requerido}"
   q "DELETE FROM pedidos WHERE id=$id;"
   echo "pedido #$id eliminado"
+  ( vec preindex >/dev/null 2>&1 & )   # poda el embedding huerfano
 }
 
 # ---------- memorias ----------
 cmd_remember() {
   local tipo="${1:?tipo requerido}" nombre="${2:?nombre requerido}" resumen="${3:?resumen requerido}"
   shift 3 || true
-  local contenido="$resumen" tags="" disp=""
+  local contenido="$resumen" tags="" disp="" force=0 thr="" noconflict=0 autotag=0
+  local relacionadas=0 via_actualizar=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --contenido)            contenido="$2"; shift 2;;
       --tags)                 tags="$2"; shift 2;;
       --dispositivo|--device) disp="$2"; shift 2;;
+      --force|-f|--no-dedupe) force=1; shift;;
+      --threshold)            thr="$2"; shift 2;;
+      --no-conflict)          noconflict=1; shift;;
+      --auto-tag)             autotag=1; shift;;
       *) echo "flag desconocido: $1" >&2; exit 2;;
     esac
   done
+  # --auto-tag: si no diste --tags, el modelo los redacta reusando tu vocabulario.
+  # Igual que el chequeo de contradicciones: solo sincronico si el modelo ya esta
+  # caliente (no congelar el guardado en frio); si esta frio, guarda sin tags y
+  # precalienta para la proxima (corre 'mem retag <nombre> --apply' luego).
+  if [[ $autotag -eq 1 && -z "$tags" ]]; then
+    if vec gen-ready 2>/dev/null; then
+      local sug
+      sug=$(vec_to "${MEM_GEN_TIMEOUT:-60}" suggest-tags \
+            --tipo="$tipo" --nombre="$nombre" --resumen="$resumen" --contenido="$contenido") || sug=""
+      [[ -n "$sug" ]] && { tags="$sug"; echo "  tags auto: $tags" >&2; }
+    else
+      echo "  (--auto-tag: modelo frío; guardo sin tags. Corre luego: mem retag '$nombre' --apply)" >&2
+      ( vec gen-warmup >/dev/null 2>&1 & )
+    fi
+  fi
+
+  # --- dedupe semantico (capa Ollama) ---
+  # Saltamos si --force, o si el nombre ya existe (eso es un update via UPSERT,
+  # no un duplicado). Best-effort: si la capa vec falla, tarda demasiado o
+  # Ollama esta caido, seguimos guardando sin deduplicar.
+  # Dos umbrales. Calibrado sobre el corpus real (qwen3 doc-vs-doc): un dup
+  # con el MISMO contenido y otro nombre puntua ~0.96-0.99; memorias no
+  # relacionadas <=0.80. Hueco limpio entre ambos.
+  #   WARN  (>=0.80) avisa y crea igual (roza temas relacionados).
+  #   BLOCK (>=0.90) frena: interactivo pregunta a/c/n; no-interactivo aborta (exit 3).
+  # --threshold N fija ambos al mismo valor (modo umbral unico). --force lo ignora.
+  # Limitacion: el indice se refresca en segundo plano tras cada 'remember', asi
+  # que dos casi-duplicados creados con segundos de diferencia pueden no verse
+  # entre si hasta que el reindex termine.
+  if [[ $force -eq 0 ]]; then
+    local existe; existe=$(q -noheader "SELECT 1 FROM memorias WHERE nombre='$(ts_arg "$nombre")' LIMIT 1;")
+    if [[ -z "$existe" ]]; then
+      local warn block num='^[0-9]*\.?[0-9]+$'
+      if [[ -n "$thr" ]]; then warn="$thr"; block="$thr"
+      else warn="${MEM_DEDUPE_WARN:-0.80}"; block="${MEM_DEDUPE_BLOCK:-0.90}"; fi
+      # nunca bloquear por configuracion invalida: valor no numerico -> default
+      [[ "$warn"  =~ $num ]] || warn=0.80
+      [[ "$block" =~ $num ]] || block=0.90
+      # valores con '=': argparse no los confunde con flags aunque empiecen por '-'
+      local -a dargs=(dupes --tipo="$tipo" --nombre="$nombre" --resumen="$resumen"
+                      --contenido="$contenido" --tags="$tags" --threshold="$warn")
+      # timeout: un modelo frio (~47s) no debe congelar el guardado -> degrada a "sin dedupe"
+      local dups
+      if command -v timeout >/dev/null 2>&1; then
+        dups=$(MEM_DB="$DB" timeout "${MEM_DEDUPE_TIMEOUT:-8}" python3 "$MEM_VEC_PY" "${dargs[@]}" 2>/dev/null) || dups=""
+      else
+        dups=$(MEM_DB="$DB" python3 "$MEM_VEC_PY" "${dargs[@]}" 2>/dev/null) || dups=""
+      fi
+      if [[ -n "$dups" ]]; then
+        relacionadas=1   # hay memorias del mismo tema -> candidatas a contradiccion
+        # primera linea = mayor score (python ordena desc). Extraccion pura-bash
+        # (sin pipes: evita SIGPIPE de 'head' bajo 'set -o pipefail').
+        local first="${dups%%$'\n'*}"
+        local topscore="${first%%$'\t'*}"
+        local _r="${first#*$'\t'}"; _r="${_r#*$'\t'}"   # salta campos score y tipo
+        local topname="${_r%%$'\t'*}"                   # campo nombre
+        echo "⚠ Ya hay memorias parecidas a '$nombre':" >&2
+        while IFS=$'\t' read -r score t n d r; do
+          [[ -z "$score" ]] && continue
+          printf '   [%s] [%s] %s (%s) — %s\n' "$score" "$t" "$n" "$d" "$r" >&2
+        done <<< "$dups"
+        # ¿el mas parecido supera el umbral de BLOQUEO? topscore debe ser numerico;
+        # LC_ALL=C para decimal con punto. Si no es numerico, degradamos a WARN.
+        if [[ "$topscore" =~ $num ]] && \
+           LC_ALL=C awk -v s="$topscore" -v b="$block" 'BEGIN{exit !((s+0) >= (b+0))}'; then
+          # Interactivo solo si hay terminal de control real (/dev/tty abrible),
+          # no segun stdin. EOF/Ctrl-D -> cancelar limpio (no abortar por set -e).
+          if { exec 3<>/dev/tty; } 2>/dev/null; then
+            local resp=""
+            printf "¿[a]ctualizar '%s' / [c]rear igual / [n] cancelar? " "$topname" >&3
+            read -r resp <&3 || resp=""
+            exec 3>&-
+            case "$resp" in
+              a|A) nombre="$topname"; via_actualizar=1;;   # UPSERT sobre la existente
+              c|C) ;;                     # crear igual
+              *)   echo "cancelado (no se guardo nada)." >&2; return 0;;
+            esac
+          else
+            echo "  → crear igual:        mem remember ... --force" >&2
+            echo "  → actualizar la otra: mem remember $tipo '$topname' '<resumen>' [...]" >&2
+            return 3
+          fi
+        else
+          echo "  (similitud bajo el umbral de bloqueo $block: se crea igual)" >&2
+        fi
+      fi
+    fi
+  fi
+
+  # --- chequeo de contradicciones (advisory, mejor-esfuerzo) ---
+  # Solo avisa, nunca bloquea. Se acota a casos con sentido:
+  #  - relacionadas=1: el dedupe ya vio memorias del mismo tema (sin eso no hay
+  #    con qué chocar y no gastamos el modelo).
+  #  - via_actualizar=0: si elegiste [a]ctualizar una regla, contradecir a la
+  #    que reemplazas es esperado; no molestamos.
+  # Si el modelo generativo NO está caliente, NO frenamos el guardado: lo
+  # precalentamos en background para la próxima. Desactivable con --no-conflict
+  # o MEM_CONFLICT_CHECK=0.
+  if [[ "${MEM_CONFLICT_CHECK:-1}" != "0" && $noconflict -eq 0 \
+        && $relacionadas -eq 1 && $via_actualizar -eq 0 ]]; then
+    if vec gen-ready 2>/dev/null; then
+      local cf
+      cf=$(vec_to "${MEM_CONFLICT_TIMEOUT:-30}" conflicts \
+             --tipo="$tipo" --nombre="$nombre" --resumen="$resumen" \
+             --contenido="$contenido" --tags="$tags" 2>/dev/null) || cf=""
+      if [[ -n "$cf" ]]; then
+        echo "⚠ Posible contradicción con memorias existentes:" >&2
+        while IFS=$'\t' read -r s n c m; do
+          [[ -z "$s" ]] && continue
+          printf '   [conf %s] choca con %s — %s\n' "$c" "$n" "$m" >&2
+        done <<< "$cf"
+        echo "   (se guarda igual; revisa si alguna quedó obsoleta)" >&2
+      fi
+    else
+      ( vec gen-warmup >/dev/null 2>&1 & )   # frío: listo para la próxima
+    fi
+  fi
+
   q "INSERT INTO memorias(tipo,nombre,resumen,contenido,tags,dispositivo)
      VALUES('$(ts_arg "$tipo")','$(ts_arg "$nombre")',
             '$(ts_arg "$resumen")','$(ts_arg "$contenido")',
@@ -244,7 +439,207 @@ cmd_remember() {
        dispositivo=CASE WHEN '$(ts_arg "$disp")'='' THEN memorias.dispositivo ELSE '$(ts_arg "$disp")' END,
        activo=1;"
   echo "memoria '$nombre' guardada"
+  # reindexa en segundo plano (no bloquea si Ollama esta caido)
+  ( vec reindex >/dev/null 2>&1 & )
 }
+
+# ---------- semantica ----------
+cmd_search() {
+  local consulta="" k=5 here=0 device=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -k)                     k="$2"; shift 2;;
+      --here)                 here=1; shift;;
+      --dispositivo|--device) device="$2"; shift 2;;
+      *) consulta="$1"; shift;;
+    esac
+  done
+  [[ -z "$consulta" ]] && { echo "uso: mem search <consulta> [-k N] [--here] [--device D]" >&2; exit 2; }
+  local extra=()
+  [[ $here -eq 1 ]] && extra+=(--here --here-device "$DEVICE")
+  [[ -n "$device" ]] && extra+=(--device "$device")
+  vec search "$consulta" -k "$k" "${extra[@]}"
+}
+
+cmd_reindex() { vec reindex "$@"; vec preindex; }   # memorias + pedidos
+cmd_preindex() { vec preindex "$@"; }               # solo pedidos
+
+# Clustering de temas. --here inyecta el device de este equipo (como search).
+# "$@" es seguro bajo set -u aunque este vacio (a diferencia de arrays nombrados).
+cmd_clusters() {
+  local here=0 a rc=0
+  for a in "$@"; do [[ "$a" == "--here" ]] && here=1; done
+  if [[ $here -eq 1 ]]; then
+    vec_to "${MEM_CLUSTER_TIMEOUT:-120}" clusters "$@" --here-device "$DEVICE" || rc=$?
+  else
+    vec_to "${MEM_CLUSTER_TIMEOUT:-120}" clusters "$@" || rc=$?
+  fi
+  case $rc in
+    0)   ;;
+    124) echo "(clustering interrumpido: timeout del etiquetado --label)" >&2 ;;
+    *)   echo "(clustering falló, rc=$rc)" >&2 ;;
+  esac
+  return $rc
+}
+
+# ---------- redaccion asistida (tags / resumen via modelo) ----------
+# Tags consistentes para una memoria; aplica el cambio con --apply.
+# Tags consistentes para una memoria. apply=1 escribe; skipreindex=1 evita el
+# reindex por-item (lo hace el caller una sola vez al final del lote).
+_retag_one() {
+  local id="$1" apply="$2" skipreindex="${3:-0}" nombre tags actuales
+  nombre=$(q -noheader "SELECT nombre FROM memorias WHERE id=$id;") || nombre=""
+  [[ -z "$nombre" ]] && { echo "  #$id: no encontrado"; return 0; }
+  tags=$(vec_to "${MEM_GEN_TIMEOUT:-60}" suggest-tags --nombre="$nombre") || tags=""
+  if [[ -z "$tags" ]]; then echo "  #$id $nombre: (sin sugerencia — modelo no disponible)"; return 0; fi
+  if [[ "$apply" -eq 1 ]]; then
+    actuales=$(q -noheader "SELECT COALESCE(tags,'') FROM memorias WHERE id=$id;") || actuales=""
+    q "UPDATE memorias SET tags='$(ts_arg "$tags")' WHERE id=$id;"
+    [[ "$skipreindex" != "1" ]] && ( vec reindex >/dev/null 2>&1 & )   # tags -> re-embed
+    echo "  #$id $nombre: ${actuales:-(sin tags)} -> $tags  [aplicado]"
+  else
+    echo "  #$id $nombre -> $tags"
+  fi
+}
+
+cmd_retag() {
+  local untagged=0 apply=0 key=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --untagged) untagged=1; shift;;
+      --apply)    apply=1; shift;;
+      *)          key="$1"; shift;;
+    esac
+  done
+  if [[ $untagged -eq 1 ]]; then
+    local ids; ids=$(q -noheader "SELECT id FROM memorias WHERE activo=1 AND (tags IS NULL OR tags='');") || ids=""
+    [[ -z "$ids" ]] && { echo "no hay memorias sin tags"; return 0; }
+    local did=0
+    # skipreindex=1 por item; un solo reindex al final (evita la tormenta de reindex)
+    while read -r id; do [[ -n "$id" ]] && { _retag_one "$id" "$apply" 1; did=1; }; done <<< "$ids"
+    [[ $apply -eq 1 && $did -eq 1 ]] && ( vec reindex >/dev/null 2>&1 & )
+    return 0
+  fi
+  [[ -z "$key" ]] && { echo "uso: mem retag <nombre|id> [--apply] | mem retag --untagged [--apply]" >&2; exit 2; }
+  local id; id=$(mem_resolve "$key"); [[ -z "$id" ]] && { echo "no encontrado: $key" >&2; exit 1; }
+  _retag_one "$id" "$apply"
+}
+
+# Recompacta el resumen de una memoria desde su contenido; aplica con --apply.
+cmd_summarize() {
+  local apply=0 key=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in --apply) apply=1; shift;; *) key="$1"; shift;; esac
+  done
+  [[ -z "$key" ]] && { echo "uso: mem summarize <nombre|id> [--apply]" >&2; exit 2; }
+  local id; id=$(mem_resolve "$key"); [[ -z "$id" ]] && { echo "no encontrado: $key" >&2; exit 1; }
+  local nombre r actual; nombre=$(q -noheader "SELECT nombre FROM memorias WHERE id=$id;") || nombre=""
+  [[ -z "$nombre" ]] && { echo "no encontrado: $key" >&2; exit 1; }   # id numerico inexistente
+  r=$(vec_to "${MEM_GEN_TIMEOUT:-60}" suggest-resumen --nombre="$nombre") || r=""
+  [[ -z "$r" ]] && { echo "(sin sugerencia — modelo no disponible)"; return 0; }
+  actual=$(q -noheader "SELECT resumen FROM memorias WHERE id=$id;") || actual=""
+  echo "resumen actual:   $actual"
+  echo "resumen sugerido: $r"
+  if [[ $apply -eq 1 ]]; then
+    q "UPDATE memorias SET resumen='$(ts_arg "$r")' WHERE id=$id;"
+    ( vec reindex >/dev/null 2>&1 & )
+    echo "[aplicado]"
+  fi
+}
+
+# Redacta resumen + tags para una memoria NUEVA a partir del contenido.
+cmd_draft() {
+  local tipo="" nombre="" contenido=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --tipo)      tipo="$2"; shift 2;;
+      --nombre)    nombre="$2"; shift 2;;
+      --contenido) contenido="$2"; shift 2;;
+      *) echo "flag desconocido: $1" >&2; exit 2;;
+    esac
+  done
+  [[ -z "$contenido" ]] && { echo "uso: mem draft --contenido \"...\" [--tipo T] [--nombre N]" >&2; exit 2; }
+  local r tags
+  r=$(vec_to "${MEM_GEN_TIMEOUT:-60}" suggest-resumen --tipo="$tipo" --nombre="$nombre" --contenido="$contenido") || r=""
+  tags=$(vec_to "${MEM_GEN_TIMEOUT:-60}" suggest-tags --tipo="$tipo" --nombre="$nombre" --contenido="$contenido") || tags=""
+  echo "resumen: ${r:-(no disponible)}"
+  echo "tags:    ${tags:-(no disponible)}"
+}
+
+# Busca pedidos por significado. Flags aca y consulta tras '--' (igual que fsearch).
+cmd_psearch() {
+  local k=5 js=0 est="" q=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -k)       k="$2"; shift 2;;
+      --estado) est="$2"; shift 2;;
+      --json)   js=1; shift;;
+      --)       shift; q="$*"; break;;
+      *)        q="$1"; shift;;
+    esac
+  done
+  [[ -z "$q" ]] && { echo "uso: mem psearch <consulta> [-k N] [--estado E] [--json]" >&2; exit 2; }
+  # rebuild de args (sin arrays vacios -> portable a bash viejo del mac)
+  set -- -k "$k"
+  [[ -n "$est" ]] && set -- "$@" "--estado=$est"   # glued: valor con '-' no confunde argparse
+  [[ $js -eq 1 ]] && set -- "$@" --json
+  vec psearch "$@" -- "$q"
+}
+
+# Staleness: memorias viejas / con fechas o versiones que quizas ya no aplican.
+# Sin modelo (puro heuristico), rapido aunque Ollama este caido.
+cmd_stale() { vec stale "$@"; }
+
+# Contradicciones de UNA memoria existente contra las relacionadas (usa el modelo).
+cmd_conflicts() {
+  local key="${1:?nombre o id requerido}"; shift || true
+  local id; id=$(mem_resolve "$key")
+  [[ -z "$id" ]] && { echo "no encontrado: $key" >&2; exit 1; }
+  local nombre; nombre=$(q -noheader "SELECT nombre FROM memorias WHERE id=$id;")
+  local out
+  out=$(vec_to "${MEM_CONFLICT_TIMEOUT:-60}" conflicts --nombre="$nombre" "$@") || out=""
+  if [[ -z "$out" ]]; then
+    echo "sin contradicciones para '$nombre' (o modelo no disponible)"
+    return 0
+  fi
+  echo "Contradicciones de '$nombre':"
+  while IFS=$'\t' read -r s n c m; do
+    [[ -z "$s" ]] && continue
+    printf '  ⚠ [conf %s] vs %s (sim %s) — %s\n' "$c" "$n" "$s" "$m"
+  done <<< "$out"
+}
+
+# Auditoria completa: staleness + contradicciones en todo el corpus (usa el modelo).
+cmd_audit() {
+  vec_to "${MEM_AUDIT_TIMEOUT:-300}" audit "$@" \
+    || echo "(auditoría interrumpida: timeout o modelo no disponible)" >&2
+}
+
+# ---------- RAG sobre archivos del disco ----------
+cmd_index()   { vec index "$@"; }     # indexa apuntes/configs/dotfiles
+cmd_files()   { vec files "$@"; }     # lista archivos/raices indexados
+cmd_fprune()  { vec fprune "$@"; }    # quita del indice los archivos borrados
+
+# Busca en archivos. Parseamos flags aca y pasamos la consulta tras '--', asi una
+# consulta que empieza con '-' (o que es '--json') no la confunde argparse.
+cmd_fsearch() {
+  local k=8 js=0 q=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -k)     k="$2"; shift 2;;
+      --json) js=1; shift;;
+      --)     shift; q="$*"; break;;
+      *)      q="$1"; shift;;
+    esac
+  done
+  [[ -z "$q" ]] && { echo "uso: mem fsearch <consulta> [-k N] [--json]" >&2; exit 2; }
+  if [[ $js -eq 1 ]]; then vec fsearch -k "$k" --json -- "$q"
+  else                     vec fsearch -k "$k" -- "$q"; fi
+}
+
+# Precarga el modelo en VRAM, totalmente desacoplado (sobrevive al hook de
+# 5s). No bloquea: el hook lo invoca y sigue.
+cmd_warmup() { setsid -f bash -c "MEM_DB='$DB' python3 '$MEM_VEC_PY' warmup" >/dev/null 2>&1 </dev/null || true; }
 
 cmd_mem_ls() {
   local tipo="" all=0 disp="" here=0
@@ -293,6 +688,8 @@ cmd_mem_toggle() {
 
 # ---------- contexto (markdown para inyectar a asistentes / sesiones) ----------
 cmd_context() {
+  local lite=0
+  [[ "${1:-}" == "--lite" ]] && lite=1
   local out=""
   local pend
   pend=$(q -noheader -separator '|' \
@@ -309,18 +706,45 @@ cmd_context() {
     out+=$'\n'
   fi
 
-  local mem
-  mem=$(q -noheader -separator '|' \
-    "SELECT tipo, nombre, resumen FROM memorias
-     WHERE activo=1 AND (dispositivo='compartida' OR dispositivo='$(ts_arg "$DEVICE")')
-     ORDER BY tipo, nombre;")
-  if [[ -n "$mem" ]]; then
-    out+="## Memorias SQLite activas"$'\n'
-    while IFS='|' read -r tipo nombre resumen; do
-      out+="- [$tipo] $nombre — $resumen"$'\n'
-    done <<< "$mem"
-    out+=$'\n'
-    out+="(Usa 'mem mem-show <nombre>' para el contenido completo, 'mem ls' para los pedidos.)"$'\n'
+  # Filtro de scope por dispositivo (compartida + este equipo).
+  local scope="activo=1 AND (dispositivo='compartida' OR dispositivo='$(ts_arg "$DEVICE")')"
+
+  if [[ $lite -eq 1 ]]; then
+    # MODO SEMÁNTICO (oficial): solo se cargan SIEMPRE las reglas e identidad
+    # (feedback + user). El grueso (project/reference) se consulta on-demand
+    # por significado con 'mem search'. Nunca gatear reglas tras similitud.
+    local reglas
+    reglas=$(q -noheader -separator '|' \
+      "SELECT tipo, nombre, resumen FROM memorias
+       WHERE $scope AND tipo IN ('feedback','user') ORDER BY tipo, nombre;")
+    if [[ -n "$reglas" ]]; then
+      out+="## Reglas e identidad (SIEMPRE activas)"$'\n'
+      while IFS='|' read -r tipo nombre resumen; do
+        out+="- [$tipo] $nombre — $resumen"$'\n'
+      done <<< "$reglas"
+      out+=$'\n'
+    fi
+    local nproj
+    nproj=$(q -noheader "SELECT COUNT(*) FROM memorias WHERE $scope AND tipo IN ('project','reference','nota');")
+    out+="## Memoria semántica (on-demand vía Ollama)"$'\n'
+    out+="Hay $nproj memorias project/reference NO cargadas aquí. Recupéralas por"$'\n'
+    out+="significado con: \`mem search \"<consulta>\" [-k N]\` (embeddings qwen3 en GPU)."$'\n'
+    out+="ANTES de actuar en una tarea concreta, corre 'mem search' sobre el tema"$'\n'
+    out+="para traer infra/credenciales/contexto relevante. El modelo se está"$'\n'
+    out+="precalentando en background (~47s en frío la 1ª vez; luego ~0.6s)."$'\n'
+    out+="Detalle completo de una memoria: 'mem mem-show <nombre>'. Pedidos: 'mem ls'."$'\n'
+  else
+    local mem
+    mem=$(q -noheader -separator '|' \
+      "SELECT tipo, nombre, resumen FROM memorias WHERE $scope ORDER BY tipo, nombre;")
+    if [[ -n "$mem" ]]; then
+      out+="## Memorias SQLite activas"$'\n'
+      while IFS='|' read -r tipo nombre resumen; do
+        out+="- [$tipo] $nombre — $resumen"$'\n'
+      done <<< "$mem"
+      out+=$'\n'
+      out+="(Usa 'mem mem-show <nombre>' para el contenido completo, 'mem ls' para los pedidos.)"$'\n'
+    fi
   fi
 
   if [[ -z "$out" ]]; then
@@ -360,7 +784,23 @@ case "$sub" in
   mem-rm)     cmd_mem_rm "$@" ;;
   mem-off)    cmd_mem_toggle "$1" 0 ;;
   mem-on)     cmd_mem_toggle "$1" 1 ;;
-  context)    cmd_context ;;
+  search)     cmd_search "$@" ;;
+  psearch)    cmd_psearch "$@" ;;
+  clusters)   cmd_clusters "$@" ;;
+  retag)      cmd_retag "$@" ;;
+  summarize)  cmd_summarize "$@" ;;
+  draft)      cmd_draft "$@" ;;
+  reindex)    cmd_reindex "$@" ;;
+  preindex)   cmd_preindex "$@" ;;
+  stale)      cmd_stale "$@" ;;
+  conflicts)  cmd_conflicts "$@" ;;
+  audit)      cmd_audit "$@" ;;
+  index)      cmd_index "$@" ;;
+  fsearch)    cmd_fsearch "$@" ;;
+  files)      cmd_files "$@" ;;
+  fprune)     cmd_fprune "$@" ;;
+  warmup)     cmd_warmup "$@" ;;
+  context)    cmd_context "$@" ;;
   device)     cmd_device "$@" ;;
   raw)        cmd_raw "$@" ;;
   *) echo "subcomando desconocido: $sub" >&2; usage; exit 2 ;;
