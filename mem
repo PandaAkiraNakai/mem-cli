@@ -155,7 +155,7 @@ BUSQUEDA SEMANTICA (embeddings locales via Ollama, modelo qwen3-embedding:4b)
                                 agrupa memorias por tema; muestra grupos y
                                 'aisladas' (huecos). --label: tema via modelo
 
-REDACCION ASISTIDA (via modelo instruct llama3.1:8b)
+REDACCION ASISTIDA (via modelo instruct qwen3:8b)
   mem retag <nombre|id> [--apply]     tags consistentes (reusa tu vocabulario)
   mem retag --untagged [--apply]      rellena tags de las memorias sin etiquetas
   mem summarize <nombre|id> [--apply] recompacta el resumen desde el contenido
@@ -164,7 +164,7 @@ REDACCION ASISTIDA (via modelo instruct llama3.1:8b)
   mem preindex                 regenera embeddings solo de pedidos (auto tras add/note/rm)
   mem warmup                   precarga el modelo en VRAM (detached, no bloquea)
 
-AUDITORIA (staleness sin modelo; contradicciones via modelo instruct llama3.1:8b)
+AUDITORIA (staleness sin modelo; contradicciones via modelo instruct qwen3:8b)
   mem stale [--days N] [--versions] [--json]
                                 memorias viejas / con fechas o versiones dudosas
   mem conflicts <nombre|id>    contradicciones de esa memoria vs las relacionadas
@@ -410,7 +410,10 @@ cmd_remember() {
         && $relacionadas -eq 1 && $via_actualizar -eq 0 ]]; then
     if vec gen-ready 2>/dev/null; then
       local cf
-      cf=$(vec_to "${MEM_CONFLICT_TIMEOUT:-30}" conflicts \
+      # Modo rapido (sin razonamiento): el chequeo inline juzga hasta -k=5 pares
+      # y tiene 30s. Con razonamiento no entra. 'mem audit'/'mem conflicts' si
+      # razonan, que se corren a proposito y priorizan precision.
+      cf=$(MEM_GEN_THINK=0 vec_to "${MEM_CONFLICT_TIMEOUT:-30}" conflicts \
              --tipo="$tipo" --nombre="$nombre" --resumen="$resumen" \
              --contenido="$contenido" --tags="$tags" 2>/dev/null) || cf=""
       if [[ -n "$cf" ]]; then
@@ -611,7 +614,10 @@ cmd_conflicts() {
 
 # Auditoria completa: staleness + contradicciones en todo el corpus (usa el modelo).
 cmd_audit() {
-  vec_to "${MEM_AUDIT_TIMEOUT:-300}" audit "$@" \
+  # 900s: el juez razona (~12s por par) y --max-pairs es 40 -> hasta ~8 min.
+  # Con los 300s viejos (calibrados para llama3.1, ~2s por par) la auditoria
+  # se cortaba a la mitad y parecia "sin contradicciones".
+  vec_to "${MEM_AUDIT_TIMEOUT:-900}" audit "$@" \
     || echo "(auditoría interrumpida: timeout o modelo no disponible)" >&2
 }
 

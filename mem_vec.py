@@ -43,7 +43,7 @@ KEEP_ALIVE = os.environ.get("MEM_KEEP_ALIVE", "30m")
 # Modelo generativo (instruct) para tareas de razonamiento: contradicciones,
 # y a futuro resumen/auto-tags. Keep-alive corto: se usa a demanda, no conviene
 # tenerlo ocupando VRAM frente a los juegos.
-GEN_MODEL = os.environ.get("MEM_GEN_MODEL", "llama3.1:8b")
+GEN_MODEL = os.environ.get("MEM_GEN_MODEL", "qwen3:8b")
 GEN_KEEP_ALIVE = os.environ.get("MEM_GEN_KEEP_ALIVE", "10m")
 
 
@@ -203,7 +203,7 @@ def gen_json(system, user, timeout=120):
     modelo ausente -> 404, respuesta no parseable). El llamador degrada con
     gracia: una funcion de auditoria nunca debe romper un flujo principal.
     """
-    body = json.dumps({
+    payload = {
         "model": GEN_MODEL,
         "messages": [{"role": "system", "content": system},
                      {"role": "user", "content": user}],
@@ -211,7 +211,14 @@ def gen_json(system, user, timeout=120):
         "format": "json",
         "keep_alive": GEN_KEEP_ALIVE,
         "options": {"temperature": 0, "num_ctx": 4096},
-    }).encode()
+    }
+    # MEM_GEN_THINK=0 -> modo rapido: apaga el razonamiento de los modelos que lo
+    # traen (qwen3 pasa de ~12s a ~3.5s por par) para que el chequeo inline de
+    # 'remember' entre en su timeout. NUNCA mandamos think=True: los modelos sin
+    # razonamiento (llama3.1) responden 400 a esa clave.
+    if os.environ.get("MEM_GEN_THINK", "1") == "0":
+        payload["think"] = False
+    body = json.dumps(payload).encode()
     req = urllib.request.Request(
         f"{OLLAMA_URL}/api/chat", data=body,
         headers={"Content-Type": "application/json"})
@@ -280,7 +287,7 @@ def judge_contradiction(a_name, a_text, b_name, b_text):
     return ver, conf, motivo
 
 
-def _judge_text(resumen, contenido, limit=800):
+def _judge_text(resumen, contenido, limit=2000):
     """Texto compacto de una memoria para que lo juzgue el modelo."""
     t = resumen or ""
     if contenido and contenido != resumen:
@@ -1220,7 +1227,12 @@ def cmd_gen_ready(args):
     base = GEN_MODEL.split(":")[0]
     for m in data.get("models", []):
         name = m.get("name", "") or m.get("model", "")
-        if name == GEN_MODEL or name.startswith(base):
+        # Comparar el nombre COMPLETO antes de ':', no por prefijo: con
+        # GEN_MODEL=qwen3:8b un startswith('qwen3') matchea qwen3-embedding:4b,
+        # que esta caliente casi siempre -> diriamos "listo" con el generativo
+        # frio y el chequeo moriria por timeout. La igualdad de base sigue
+        # tolerando variantes de tag (qwen3:8b-q4_K_M).
+        if name == GEN_MODEL or name.split(":")[0] == base:
             sys.exit(0)
     sys.exit(1)
 

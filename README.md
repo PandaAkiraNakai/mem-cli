@@ -165,13 +165,24 @@ Si tienes muchas memorias, el listado plano de `mem context` deja de servir como
 
 - [Ollama](https://ollama.com) corriendo local (CPU o GPU).
 - Modelo de embeddings: `qwen3-embedding:4b` (multilingüe, ~2.5GB, recomendado).
-- Opcional, para razonamiento (`mem conflicts`, etc.): `llama3.1:8b` instruct.
+- Modelo instruct para razonamiento: `qwen3:8b` (~5.2GB). Lo usan `summarize`,
+  `retag`, `draft`, `--auto-tag` y el chequeo de contradicciones de
+  `remember` / `conflicts` / `audit`.
 - Python 3 (sólo stdlib — no hay pip install).
 
 ```bash
 ollama pull qwen3-embedding:4b
-ollama pull llama3.1:8b           # opcional
+ollama pull qwen3:8b
 ```
+
+> Si falta el modelo instruct, esos comandos degradan **en silencio**: `mem audit`
+> llega a imprimir "sin contradicciones detectadas" cuando en realidad nunca pudo
+> preguntar. Verifica con `mem conflicts <alguna-memoria>` después de instalar.
+>
+> El modelo por defecto se eligió midiendo sobre un banco de 12 pares reales:
+> `llama3.1:8b` marcaba como contradicción los 7 pares que **no** lo eran (precisión
+> 0.36) y no mejoraba apretando el prompt; `qwen3:8b` acierta 5/5 sin ningún falso
+> positivo. Si cambias `MEM_GEN_MODEL`, vuelve a medir antes de confiar en el aviso.
 
 El backend Python `mem_vec.py` se distribuye junto al script principal en este repo. Cópialo a `${XDG_DATA_HOME:-~/.local/share}/mem/mem_vec.py` (o configura `MEM_VEC_PY` apuntando a su ruta).
 
@@ -221,7 +232,10 @@ El hook de Claude Code recomendado es `mem context --lite` + `mem warmup` para n
 | Variable | Default | Para qué |
 |----------|---------|----------|
 | `MEM_EMBED_MODEL` | `qwen3-embedding:4b` | Modelo de embeddings. Cambiar invalida el cache (rehash). |
-| `MEM_GEN_MODEL` | `llama3.1:8b` | Modelo instruct para razonamiento. |
+| `MEM_GEN_MODEL` | `qwen3:8b` | Modelo instruct para razonamiento. |
+| `MEM_GEN_THINK` | `1` | `0` apaga el razonamiento del modelo (qwen3 pasa de ~12s a ~3.5s por par, a costa de precisión). El chequeo inline de `remember` ya lo usa; `audit` y `conflicts` no. |
+| `MEM_CONFLICT_TIMEOUT` | `30` (inline) / `60` | Segundos para el chequeo de contradicciones. |
+| `MEM_AUDIT_TIMEOUT` | `900` | Segundos para `mem audit` completo (~12s por par con razonamiento, hasta 40 pares). |
 | `OLLAMA_URL` | `http://localhost:11434` | Endpoint de Ollama. |
 | `MEM_KEEP_ALIVE` | `30m` | Tiempo que el modelo de embeddings queda en VRAM tras el último uso. |
 | `MEM_DEDUPE_WARN` | `0.80` | Similitud sobre la que `mem remember` avisa de duplicado. |
