@@ -219,13 +219,30 @@ mem retag                 # sugiere tags via LLM
 
 ### Modo lite en `mem context`
 
-Por defecto `mem context` inyecta todas las memorias activas. Con muchas se desborda — el modo lite muestra sólo identidad + las reglas siempre activas y delega el resto a búsqueda on-demand:
+Por defecto `mem context` inyecta todas las memorias activas. Con muchas se desborda — el modo lite muestra sólo los pedidos pendientes y la guía para usar `mem search`, y delega el resto a búsqueda on-demand:
 
 ```bash
 mem context --lite
 ```
 
-El hook de Claude Code recomendado es `mem context --lite` + `mem warmup` para no llenar el contexto al inicio y mantener el modelo caliente para los `mem search` que el asistente haga durante la sesión.
+El hook de Claude Code recomendado es `mem rules-md --quiet` + `mem warmup` + `mem context --lite` para no llenar el contexto al inicio y mantener el modelo caliente para los `mem search` que el asistente haga durante la sesión.
+
+### Reglas fijas vía `CLAUDE.md`
+
+Claude Code corta el `additionalContext` de un hook a 10.000 caracteres: lo que sobra va a un archivo y el asistente sólo ve un preview de ~2 KB. Por eso las reglas que deben estar **siempre** activas no van en el hook, sino en un archivo que se importa desde `~/.claude/CLAUDE.md` (que se carga completo):
+
+```bash
+mem fijar espanol-neutro      # marca la memoria con el tag 'fija'
+mem desfijar espanol-neutro
+mem rules-md                  # escribe las fijas en ~/.claude/mem-reglas.md (MEM_RULES_MD para cambiarlo)
+```
+
+```markdown
+<!-- ~/.claude/CLAUDE.md -->
+@~/.claude/mem-reglas.md
+```
+
+El archivo se regenera solo al hacer `mem remember`, `mem fijar`/`desfijar`, `mem mem-on`/`mem-off`/`mem-rm` y en el hook `SessionStart`. Las reglas no fijas siguen disponibles por `mem search` (las de tipo feedback salen igual que el resto). `retag` y `remember` conservan el tag `fija`.
 
 ### Variables de entorno
 

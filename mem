@@ -9,6 +9,8 @@
 set -euo pipefail
 
 DB="${MEM_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/mem/memory.db}"
+# Regla fija: tag 'fija' en la lista csv de tags (va a ~/.claude/mem-reglas.md).
+FIJA_SQL="(','||COALESCE(tags,'')||',') LIKE '%,fija,%'"
 SQLITE=$(command -v sqlite3)
 
 if [[ -z "$SQLITE" ]]; then
@@ -181,13 +183,15 @@ RAG SOBRE TUS ARCHIVOS (apuntes, configs, dotfiles — busqueda por significado)
   mem files [--json]           lista raices y archivos indexados
   mem fprune                   quita del indice los archivos que ya no existen
 
-CONTEXTO LITE (modo oficial: solo reglas+identidad, resto on-demand)
+CONTEXTO (hook: pedidos + guía de mem search; reglas fijas vía CLAUDE.md; resto on-demand)
   mem context --lite           lo que inyecta el hook SessionStart
+  mem rules-md [--quiet]       reglas con tag 'fija' -> ~/.claude/mem-reglas.md (CLAUDE.md)
+  mem fijar|desfijar <nombre>  marca/desmarca una regla como fija (siempre cargada)
 
 DISPOSITIVO (scope: qué memorias ve cada equipo)
   mem device                   muestra la etiqueta de este equipo
   mem device <nombre>          fija la etiqueta (escribe .device junto a la DB)
-  --dispositivo D al recordar  D = compartida (default) | torre | laptop | mac | ...
+  --dispositivo D al recordar  D = compartida (default) | etiqueta de 'mem device' (torre, laptop, celu...)
   Solo se inyectan al contexto las memorias 'compartida' + las de ESTE equipo.
   Precedencia de la etiqueta: $MEM_DEVICE > .device > hostname.
 
@@ -438,10 +442,14 @@ cmd_remember() {
        tipo=excluded.tipo,
        resumen=excluded.resumen,
        contenido=excluded.contenido,
-       tags=excluded.tags,
+       tags=CASE WHEN (','||COALESCE(memorias.tags,'')||',') LIKE '%,fija,%'
+                  AND (','||COALESCE(excluded.tags,'')||',') NOT LIKE '%,fija,%'
+                 THEN COALESCE(excluded.tags||',','')||'fija'
+                 ELSE excluded.tags END,
        dispositivo=CASE WHEN '$(ts_arg "$disp")'='' THEN memorias.dispositivo ELSE '$(ts_arg "$disp")' END,
        activo=1;"
   echo "memoria '$nombre' guardada"
+  cmd_rules_md --quiet
   # reindexa en segundo plano (no bloquea si Ollama esta caido)
   ( vec reindex >/dev/null 2>&1 & )
 }
@@ -497,6 +505,8 @@ _retag_one() {
   if [[ -z "$tags" ]]; then echo "  #$id $nombre: (sin sugerencia — modelo no disponible)"; return 0; fi
   if [[ "$apply" -eq 1 ]]; then
     actuales=$(q -noheader "SELECT COALESCE(tags,'') FROM memorias WHERE id=$id;") || actuales=""
+    # el tag 'fija' (regla que va al CLAUDE.md) no lo decide el modelo: se conserva
+    if [[ ",$actuales," == *,fija,* && ",$tags," != *,fija,* ]]; then tags="$tags,fija"; fi
     q "UPDATE memorias SET tags='$(ts_arg "$tags")' WHERE id=$id;"
     [[ "$skipreindex" != "1" ]] && ( vec reindex >/dev/null 2>&1 & )   # tags -> re-embed
     echo "  #$id $nombre: ${actuales:-(sin tags)} -> $tags  [aplicado]"
@@ -682,6 +692,7 @@ cmd_mem_rm() {
   [[ -z "$id" ]] && { echo "no encontrado: $key" >&2; exit 1; }
   q "DELETE FROM memorias WHERE id=$id;"
   echo "memoria #$id eliminada"
+  cmd_rules_md --quiet
 }
 
 cmd_mem_toggle() {
@@ -690,6 +701,7 @@ cmd_mem_toggle() {
   [[ -z "$id" ]] && { echo "no encontrado: $key" >&2; exit 1; }
   q "UPDATE memorias SET activo=$valor WHERE id=$id;"
   echo "memoria #$id activo=$valor"
+  cmd_rules_md --quiet
 }
 
 # ---------- contexto (markdown para inyectar a asistentes / sesiones) ----------
@@ -716,27 +728,20 @@ cmd_context() {
   local scope="activo=1 AND (dispositivo='compartida' OR dispositivo='$(ts_arg "$DEVICE")')"
 
   if [[ $lite -eq 1 ]]; then
-    # MODO SEMÁNTICO (oficial): solo se cargan SIEMPRE las reglas e identidad
-    # (feedback + user). El grueso (project/reference) se consulta on-demand
-    # por significado con 'mem search'. Nunca gatear reglas tras similitud.
-    local reglas
-    reglas=$(q -noheader -separator '|' \
-      "SELECT tipo, nombre, resumen FROM memorias
-       WHERE $scope AND tipo IN ('feedback','user') ORDER BY tipo, nombre;")
-    if [[ -n "$reglas" ]]; then
-      out+="## Reglas e identidad (SIEMPRE activas)"$'\n'
-      while IFS='|' read -r tipo nombre resumen; do
-        out+="- [$tipo] $nombre — $resumen"$'\n'
-      done <<< "$reglas"
-      out+=$'\n'
-    fi
-    local nproj
-    nproj=$(q -noheader "SELECT COUNT(*) FROM memorias WHERE $scope AND tipo IN ('project','reference','nota');")
+    # MODO SEMÁNTICO (oficial): las reglas con tag 'fija' NO van aquí sino en
+    # ~/.claude/mem-reglas.md (importado desde ~/.claude/CLAUDE.md, ver
+    # 'mem rules-md'), porque Claude Code corta el additionalContext de hooks a
+    # 10.000 caracteres. Todo lo demás (incluidas las reglas no fijas) se
+    # consulta on-demand por significado con 'mem search'.
+    local nfijas nsem
+    nfijas=$(q -noheader "SELECT COUNT(*) FROM memorias WHERE $scope AND $FIJA_SQL;")
+    nsem=$(q -noheader "SELECT COUNT(*) FROM memorias WHERE $scope AND NOT $FIJA_SQL;")
     out+="## Memoria semántica (on-demand vía Ollama)"$'\n'
-    out+="Hay $nproj memorias project/reference NO cargadas aquí. Recupéralas por"$'\n'
-    out+="significado con: \`mem search \"<consulta>\" [-k N]\` (embeddings qwen3 en GPU)."$'\n'
+    out+="Las $nfijas reglas fijas están en ~/.claude/mem-reglas.md (cargado por CLAUDE.md)."$'\n'
+    out+="Hay otras $nsem memorias (reglas por tema, project, reference) NO cargadas aquí."$'\n'
+    out+="Recupéralas por significado con: \`mem search \"<consulta>\" [-k N]\` (qwen3 en GPU)."$'\n'
     out+="ANTES de actuar en una tarea concreta, corre 'mem search' sobre el tema"$'\n'
-    out+="para traer infra/credenciales/contexto relevante. El modelo se está"$'\n'
+    out+="para traer reglas/infra/credenciales/contexto relevante. El modelo se está"$'\n'
     out+="precalentando en background (~47s en frío la 1ª vez; luego ~0.6s)."$'\n'
     out+="Detalle completo de una memoria: 'mem mem-show <nombre>'. Pedidos: 'mem ls'."$'\n'
   else
@@ -758,6 +763,47 @@ cmd_context() {
   else
     echo "$out"
   fi
+}
+
+# ---------- reglas fijas -> ~/.claude/mem-reglas.md ----------
+# Las memorias con tag 'fija' se cargan SIEMPRE vía CLAUDE.md (sin el tope de
+# 10.000 caracteres de los hooks). Se regenera en el hook SessionStart y al
+# guardar/fijar/desfijar.
+RULES_MD="${MEM_RULES_MD:-$HOME/.claude/mem-reglas.md}"
+
+cmd_rules_md() {
+  local scope="activo=1 AND (dispositivo='compartida' OR dispositivo='$(ts_arg "$DEVICE")')"
+  local filas tmp
+  filas=$(q -noheader -separator '|' \
+    "SELECT tipo, nombre, replace(resumen, char(10), ' ') FROM memorias
+     WHERE $scope AND $FIJA_SQL ORDER BY tipo DESC, nombre;")
+  mkdir -p "$(dirname "$RULES_MD")"
+  tmp=$(mktemp "$RULES_MD.XXXXXX")
+  {
+    echo "<!-- Generado por 'mem rules-md' desde $DB (equipo: $DEVICE). NO editar a mano: -->"
+    echo "<!-- cambia la memoria con 'mem remember' / 'mem fijar' / 'mem desfijar'. -->"
+    echo "## Reglas fijas (SIEMPRE activas)"
+    echo "Las reglas por tema (no fijas) se recuperan con 'mem search'. Detalle: 'mem mem-show <nombre>'."
+    echo
+    while IFS='|' read -r tipo nombre resumen; do
+      [[ -n "$nombre" ]] && echo "- [$tipo] $nombre — $resumen"
+    done <<< "$filas"
+  } > "$tmp"
+  mv -f "$tmp" "$RULES_MD"
+  [[ "${1:-}" == "--quiet" ]] || echo "$(grep -c '^- ' "$RULES_MD") reglas fijas -> $RULES_MD"
+}
+
+cmd_fijar() {
+  local key="${1:?uso: mem fijar|desfijar <nombre|id>}" valor="$2" id
+  id=$(mem_resolve "$key"); [[ -z "$id" ]] && { echo "no encontrado: $key" >&2; exit 1; }
+  if [[ "$valor" == 1 ]]; then
+    q "UPDATE memorias SET tags = CASE WHEN tags IS NULL OR tags='' THEN 'fija' ELSE tags||',fija' END
+       WHERE id=$id AND NOT $FIJA_SQL;"
+  else
+    q "UPDATE memorias SET tags = NULLIF(trim(replace(','||tags||',', ',fija,', ','), ','), '')
+       WHERE id=$id;"
+  fi
+  cmd_rules_md
 }
 
 cmd_raw() { q "$@"; }
@@ -790,6 +836,9 @@ case "$sub" in
   mem-rm)     cmd_mem_rm "$@" ;;
   mem-off)    cmd_mem_toggle "$1" 0 ;;
   mem-on)     cmd_mem_toggle "$1" 1 ;;
+  rules-md)   cmd_rules_md "$@" ;;
+  fijar)      cmd_fijar "$1" 1 ;;
+  desfijar)   cmd_fijar "$1" 0 ;;
   search)     cmd_search "$@" ;;
   psearch)    cmd_psearch "$@" ;;
   clusters)   cmd_clusters "$@" ;;
